@@ -1,0 +1,257 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: WealthSimple Demo Backend (SAM) — API, SQS, MSK, S3, DynamoDB
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 30
+    MemorySize: 256
+    Tracing: Active
+    Environment:
+      Variables:
+        REGION: !Ref AWS::Region
+        S3_ARCHIVE_BUCKET: !Ref S3ArchiveBucketName
+        S3_ARCHIVE_PREFIX: trades/
+        ACCOUNTS_TABLE: !Ref AccountsTableName
+        SQS_TRADES_IN_URL: !Ref TradesQueue
+        MSK_CLUSTER_ARN: !Ref MSKClusterArn
+        TRADES_TOPIC_NAME: !Ref TradesTopicName
+
+Parameters:
+  # MSK (provisioned outside SAM — pass in via params.dev.json)
+  MSKClusterArn:
+    Type: String
+    Description: ARN of existing MSK or MSK Serverless cluster
+  TradesTopicName:
+    Type: String
+    Default: trades
+    Description: Kafka topic name for trades
+  # VPC config used by Lambdas that talk to MSK
+  MskSubnetIds:
+    Type: List<String>
+    Description: Private subnet IDs with network access to MSK brokers
+  MskSecurityGroupIds:
+    Type: List<String>
+    Description: Security group IDs that allow egress to MSK brokers
+  # App resources
+  S3ArchiveBucketName:
+    Type: String
+    Description: S3 bucket to archive Kafka events
+  AccountsTableName:
+    Type: String
+    Default: Accounts
+  TradesQueueName:
+    Type: String
+    Default: trades-in
+
+Resources:
+
+  # -------------------------
+  # Storage & Queue
+  # -------------------------
+  ArchiveBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref S3ArchiveBucketName
+
+  AccountsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref AccountsTableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: accountId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: accountId
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+
+  TradesQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Ref TradesQueueName
+      VisibilityTimeout: 60
+
+  # -------------------------
+  # API Lambdas
+  # -------------------------
+
+  PricesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../../lambdas/prices/
+      Handler: handler.lambda_handler
+      Policies:
+        - AWSLambdaBasicExecutionRole
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            Path: /prices
+            Method: get
+
+  TradeIngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../../lambdas/trade_ingest/
+      Handler: handler.lambda_handler
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - SQSSendMessagePolicy:
+            QueueName: !Ref TradesQueueName
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            Path: /trade
+            Method: post
+
+  BalanceFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../../lambdas/balance/
+      Handler: handler.lambda_handler
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - DynamoDBReadPolicy:
+            TableName: !Ref AccountsTableName
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            Path: /balance
+            Method: get
+
+  # -------------------------
+  # Pipelines
+  # -------------------------
+
+  # SQS -> MSK (producer)
+  SqsToKafkaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../../lambdas/sqs_to_kafka/
+      Handler: handler.lambda_handler
+      VpcConfig:
+        SecurityGroupIds: !Ref MskSecurityGroupIds
+        SubnetIds: !Ref MskSubnetIds
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - SQSPollerPolicy:
+            QueueName: !Ref TradesQueueName
+        # MSK control-plane (discover brokers)
+        - Statement:
+            Effect: Allow
+            Action:
+              - kafka:GetBootstrapBrokers
+              - kafka:DescribeClusterV2
+            Resource: "*"
+        # MSK IAM access-control (data plane)
+        - Statement:
+            Effect: Allow
+            Action:
+              - kafka-cluster:Connect
+              - kafka-cluster:DescribeTopic
+              - kafka-cluster:WriteData
+            Resource:
+              - !Ref MSKClusterArn
+              # Topic ARN pattern (scoped to your account/region/cluster; '*' for cluster-id segment)
+              - !Sub "arn:aws:kafka:${AWS::Region}:${AWS::AccountId}:topic/*/${TradesTopicName}"
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt TradesQueue.Arn
+            BatchSize: 10
+
+  # MSK -> S3 (archive)
+  KafkaToS3Function:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../../lambdas/kafka_to_s3/
+      Handler: handler.lambda_handler
+      VpcConfig:
+        SecurityGroupIds: !Ref MskSecurityGroupIds
+        SubnetIds: !Ref MskSubnetIds
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - S3WritePolicy:
+            BucketName: !Ref S3ArchiveBucketName
+        - Statement:
+            Effect: Allow
+            Action:
+              - kafka:GetBootstrapBrokers
+              - kafka:DescribeClusterV2
+            Resource: "*"
+        - Statement:
+            Effect: Allow
+            Action:
+              - kafka-cluster:Connect
+              - kafka-cluster:ReadData
+              - kafka-cluster:DescribeTopic
+            Resource:
+              - !Ref MSKClusterArn
+              - !Sub "arn:aws:kafka:${AWS::Region}:${AWS::AccountId}:topic/*/${TradesTopicName}"
+      Events:
+        KafkaEvent:
+          Type: MSK
+          Properties:
+            Stream: !Ref MSKClusterArn
+            Topics:
+              - !Ref TradesTopicName
+            StartingPosition: TRIM_HORIZON
+            BatchSize: 100
+            MaximumBatchingWindowInSeconds: 5
+
+  # MSK -> DynamoDB (fast /balance snapshot)
+  KafkaToDdbFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../../lambdas/kafka_to_ddb/
+      Handler: handler.lambda_handler
+      VpcConfig:
+        SecurityGroupIds: !Ref MskSecurityGroupIds
+        SubnetIds: !Ref MskSubnetIds
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AccountsTableName
+        - Statement:
+            Effect: Allow
+            Action:
+              - kafka:GetBootstrapBrokers
+              - kafka:DescribeClusterV2
+            Resource: "*"
+        - Statement:
+            Effect: Allow
+            Action:
+              - kafka-cluster:Connect
+              - kafka-cluster:ReadData
+              - kafka-cluster:DescribeTopic
+            Resource:
+              - !Ref MSKClusterArn
+              - !Sub "arn:aws:kafka:${AWS::Region}:${AWS::AccountId}:topic/*/${TradesTopicName}"
+      Events:
+        KafkaEvent:
+          Type: MSK
+          Properties:
+            Stream: !Ref MSKClusterArn
+            Topics:
+              - !Ref TradesTopicName
+            StartingPosition: TRIM_HORIZON
+            BatchSize: 100
+            MaximumBatchingWindowInSeconds: 5
+
+Outputs:
+  ApiUrl:
+    Description: Base URL for your API Gateway (implicit API)
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/"
+  ArchiveBucketName:
+    Value: !Ref S3ArchiveBucketName
+  AccountsTableOut:
+    Value: !Ref AccountsTableName
+  TradesQueueUrl:
+    Value: !Ref TradesQueue

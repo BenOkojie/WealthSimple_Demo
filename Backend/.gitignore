@@ -1,0 +1,54 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pkl
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# ---- Virtual environments ----
+.venv/
+venv/
+env/
+ENV/
+
+# ---- OS files ----
+.DS_Store
+Thumbs.db
+
+# ---- AWS SAM / CloudFormation ----
+.aws-sam/
+.sam-cache/
+.terraform/
+.terraform.lock.hcl
+terraform.tfstate
+terraform.tfstate.backup
+
+# ---- Logs ----
+*.log
+
+# ---- IDEs / Editors ----
+.vscode/
+.idea/
+*.swp
+
+# ---- NodeJS (if you mix with frontend tooling in same repo) ----
+node_modules/
+
+# ---- Local config / secrets ----
+.env
+.env.*
+params.dev.json
+params.stage.json
+params.prod.json
+*.pem
+*.key
+*.crt
+
+# ---- Cache / test outputs ----
+.pytest_cache/
+.coverage
+htmlcov/

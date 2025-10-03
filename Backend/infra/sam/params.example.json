@@ -1,0 +1,18 @@
+{
+  "Parameters": {
+    "MSKClusterArn": "arn:aws:kafka:us-east-1:123456789012:cluster/your-msk-serverless/abcd-efgh-ijkl",
+    "TradesTopicName": "trades",
+
+    "MskSubnetIds": [
+      "subnet-aaaaaaaa",
+      "subnet-bbbbbbbb"
+    ],
+    "MskSecurityGroupIds": [
+      "sg-cccccccc"
+    ],
+
+    "S3ArchiveBucketName": "ws-demo-trades-archive-yourname",
+    "AccountsTableName": "Accounts",
+    "TradesQueueName": "trades-in"
+  }
+}
