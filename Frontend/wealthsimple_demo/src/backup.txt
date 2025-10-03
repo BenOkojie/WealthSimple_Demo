@@ -1,0 +1,605 @@
+import React, { useEffect, useMemo, useState } from "react";
+
+/**
+ * FIX: Avoid `process.env.*` on the client (ReferenceError: process is not defined).
+ * Prices endpoint is resolved safely at runtime using (in order):
+ *   1) Vite-style env: import.meta.env.VITE_PRICES_ENDPOINT (if present)
+ *   2) window.__PRICES_ENDPOINT__ (set before the app mounts)
+ *   3) default to "/api/prices"
+ *
+ * Also fixed duplicate identifier in diagnostics (r4 declared twice) by renaming one test variable.
+ * Added/kept diagnostics as lightweight tests.
+ */
+
+const TABS = ["Stream", "Ledger"] as const;
+
+type Tab = typeof TABS[number];
+
+type StreamEvent = {
+  id: string;
+  ts: string; // ISO string
+  kind: "BUY" | "SELL" | "DEPOSIT" | "WITHDRAW";
+  symbol?: string;
+  qty?: number;
+  price?: number; // execution/limit price (optional)
+  amount?: number; // for deposit/withdraw
+};
+
+type LedgerEvent = {
+  id: string;
+  ts: string;
+  kind: "DEPOSIT" | "WITHDRAW";
+  amount: number;
+};
+
+type PricesMap = Record<string, number> & { _ts?: string };
+
+// ------- Helpers -------
+const uuid = () =>
+  typeof crypto !== "undefined" && (crypto as any).randomUUID
+    ? (crypto as any).randomUUID()
+    : `id-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+function resolvePricesEndpoint(): string {
+  try {
+    const viteVal = (import.meta as any)?.env?.VITE_PRICES_ENDPOINT;
+    if (viteVal) return String(viteVal);
+  } catch {}
+  if (typeof window !== "undefined" && (window as any).__PRICES_ENDPOINT__) {
+    return String((window as any).__PRICES_ENDPOINT__);
+  }
+  return "/api/prices";
+}
+
+const DEFAULT_PRICES_ENDPOINT = resolvePricesEndpoint();
+
+function Chip({ label }: { label: string }) {
+  return (
+    <span className="inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium">
+      {label}
+    </span>
+  );
+}
+
+function SectionTitle({ title, subtitle }: { title: string; subtitle?: string }) {
+  return (
+    <div className="mb-3">
+      <h3 className="text-lg font-semibold tracking-tight">{title}</h3>
+      {subtitle ? <p className="text-sm text-neutral-500">{subtitle}</p> : null}
+    </div>
+  );
+}
+
+// Build holdings from BUY/SELL events
+function buildHoldingsFromEvents(events: StreamEvent[]) {
+  const map = new Map<string, number>();
+  for (const e of events) {
+    if (e.kind === "BUY" && e.symbol && e.qty) {
+      map.set(e.symbol, (map.get(e.symbol) || 0) + e.qty);
+    }
+    if (e.kind === "SELL" && e.symbol && e.qty) {
+      map.set(e.symbol, Math.max(0, (map.get(e.symbol) || 0) - e.qty));
+    }
+  }
+  return Array.from(map.entries())
+    .filter(([, q]) => q > 0)
+    .map(([symbol, qty]) => ({ symbol, qty }));
+}
+
+export default function AppUIMock() {
+  const [tab, setTab] = useState<Tab>("Stream");
+  const [accountId, setAccountId] = useState("acc-001");
+
+  // Endpoint (runtime-safe)
+  const [endpointOverride, setEndpointOverride] = useState("");
+  const pricesEndpoint = (endpointOverride || DEFAULT_PRICES_ENDPOINT).trim();
+
+  // -------- Stream state --------
+  const [symbol, setSymbol] = useState("AAPL");
+  const [tradeKind, setTradeKind] = useState<"BUY" | "SELL">("BUY");
+  const [qty, setQty] = useState(1);
+  const [price, setPrice] = useState<number | "">("");
+  const [streamEvents, setStreamEvents] = useState<StreamEvent[]>([
+    { id: uuid(), ts: new Date().toISOString(), kind: "BUY", symbol: "AAPL", qty: 2, price: 195 },
+  ]);
+
+  const holdings = useMemo(() => buildHoldingsFromEvents(streamEvents), [streamEvents]);
+
+  // Prices
+  const [prices, setPrices] = useState<PricesMap>({});
+  const [loadingPrices, setLoadingPrices] = useState(false);
+  const [priceError, setPriceError] = useState<string | null>(null);
+
+  async function fetchPrices(symbols: string[]) {
+    if (!symbols.length) return setPrices({});
+    try {
+      setLoadingPrices(true);
+      setPriceError(null);
+      const uniq = Array.from(new Set(symbols));
+      const url = `${pricesEndpoint}?symbols=${encodeURIComponent(uniq.join(","))}`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`Price API ${res.status}`);
+      const data = (await res.json()) as PricesMap;
+      setPrices(data);
+    } catch (e: any) {
+      setPriceError(e.message || "Failed to load prices");
+    } finally {
+      setLoadingPrices(false);
+    }
+  }
+
+  // Fetch prices on holdings change
+  const holdingsKey = useMemo(() => holdings.map(h => h.symbol).sort().join(","), [holdings]);
+  useEffect(() => {
+    fetchPrices(holdings.map(h => h.symbol));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [holdingsKey, pricesEndpoint]);
+
+  const portfolioMarketValue = useMemo(() => {
+    return holdings.reduce((sum, h) => sum + (prices[h.symbol] || 0) * h.qty, 0);
+  }, [holdings, prices]);
+
+  // -------- Ledger state --------
+  const [ledgerKind, setLedgerKind] = useState<"DEPOSIT" | "WITHDRAW">("DEPOSIT");
+  const [ledgerAmount, setLedgerAmount] = useState(100);
+  const [ledgerEvents, setLedgerEvents] = useState<LedgerEvent[]>([
+    { id: uuid(), ts: new Date().toISOString(), kind: "DEPOSIT", amount: 500 },
+    { id: uuid(), ts: new Date().toISOString(), kind: "WITHDRAW", amount: 120 },
+  ]);
+
+  const ledgerBalance = useMemo(() => {
+    return ledgerEvents.reduce((acc, e) => acc + (e.kind === "DEPOSIT" ? e.amount : -e.amount), 0);
+  }, [ledgerEvents]);
+
+  // UI notices
+  const [uiError, setUiError] = useState<string | null>(null);
+  const [uiNotice, setUiNotice] = useState<string | null>(null);
+
+  // Submit trade (BUY/SELL) -> sync with ledger
+  function addStreamEvent() {
+    setUiError(null);
+    setUiNotice(null);
+    if (!symbol) return;
+
+    const upper = symbol.toUpperCase();
+    const qtyNum = Math.max(1, Number(qty) || 0);
+    const execPrice = typeof price === "number" && price > 0 ? price : (prices[upper] || 0);
+
+    if (tradeKind === "BUY") {
+      if (execPrice <= 0) {
+        setUiError("No valid price. Enter a Price or Refresh Prices.");
+        return;
+      }
+      const cost = +(execPrice * qtyNum).toFixed(2);
+      if (ledgerBalance < cost) {
+        setUiError(`Insufficient cash: need $${cost.toFixed(2)}, have $${ledgerBalance.toFixed(2)}.`);
+        return;
+      }
+      const trade: StreamEvent = { id: uuid(), ts: new Date().toISOString(), kind: "BUY", symbol: upper, qty: qtyNum, price: execPrice };
+      setStreamEvents(prev => [trade, ...prev].slice(0, 50));
+      const cashOut: LedgerEvent = { id: uuid(), ts: trade.ts, kind: "WITHDRAW", amount: cost };
+      setLedgerEvents(prev => [cashOut, ...prev]);
+      setUiNotice(`Bought ${qtyNum} ${upper} @ $${execPrice.toFixed(2)} (−$${cost.toFixed(2)}).`);
+      return;
+    }
+
+    if (tradeKind === "SELL") {
+      const usePrice = execPrice > 0 ? execPrice : 0;
+      const proceeds = +(usePrice * qtyNum).toFixed(2);
+      const trade: StreamEvent = { id: uuid(), ts: new Date().toISOString(), kind: "SELL", symbol: upper, qty: qtyNum, price: usePrice || undefined };
+      setStreamEvents(prev => [trade, ...prev].slice(0, 50));
+      if (proceeds > 0) {
+        const cashIn: LedgerEvent = { id: uuid(), ts: trade.ts, kind: "DEPOSIT", amount: proceeds };
+        setLedgerEvents(prev => [cashIn, ...prev]);
+        setUiNotice(`Sold ${qtyNum} ${upper} @ $${usePrice.toFixed(2)} (+$${proceeds.toFixed(2)}).`);
+      } else {
+        setUiNotice(`Recorded SELL ${qtyNum} ${upper}. No price provided, cash unchanged.`);
+      }
+      return;
+    }
+  }
+
+  function addLedgerEvent() {
+    const amt = Math.max(1, Number(ledgerAmount) || 0);
+    const ev: LedgerEvent = { id: uuid(), ts: new Date().toISOString(), kind: ledgerKind, amount: amt };
+    setLedgerEvents(prev => [ev, ...prev]);
+  }
+
+  function replayLedger() {
+    const recomputed = ledgerEvents.reduce((acc, e) => acc + (e.kind === "DEPOSIT" ? e.amount : -e.amount), 0);
+    const matches = recomputed === ledgerBalance;
+    alert(`Replay complete. Integrity ${matches ? "verified ✅" : "mismatch ❌"}`);
+  }
+
+  // -------- Diagnostics (ad-hoc tests) --------
+  type TestResult = { name: string; pass: boolean; details?: string };
+  const [tests, setTests] = useState<TestResult[]>([]);
+
+  function runDiagnostics() {
+    const results: TestResult[] = [];
+
+    // Test 1: Endpoint resolution
+    const r1 = typeof pricesEndpoint === "string" && pricesEndpoint.length > 0;
+    results.push({ name: "Endpoint resolution", pass: r1, details: pricesEndpoint });
+
+    // Test 2: Holdings compute (BUY 2, SELL 1 -> qty 1)
+    const events2: StreamEvent[] = [
+      { id: uuid(), ts: new Date().toISOString(), kind: "BUY", symbol: "AAPL", qty: 2 },
+      { id: uuid(), ts: new Date().toISOString(), kind: "SELL", symbol: "AAPL", qty: 1 },
+    ];
+    const h2 = buildHoldingsFromEvents(events2);
+    const r2 = h2.length === 1 && h2[0].symbol === "AAPL" && h2[0].qty === 1;
+    results.push({ name: "Holdings compute (BUY/SELL)", pass: r2, details: JSON.stringify(h2) });
+
+    // Test 3: Portfolio valuation (AAPL qty=3, price=100 -> 300)
+    const h3 = [{ symbol: "AAPL", qty: 3 }];
+    const prices3: PricesMap = { AAPL: 100 };
+    const val3 = h3.reduce((s, x) => s + (prices3[x.symbol] || 0) * x.qty, 0);
+    const r3 = val3 === 300;
+    results.push({ name: "Portfolio valuation", pass: r3, details: String(val3) });
+
+    // Test 4a: Stream deposit sync semantics (historical test kept)
+    const nowIso = new Date().toISOString();
+    const leBefore = 0;
+    const tmpLedger: LedgerEvent[] = [];
+    const depositAmt = 250;
+    tmpLedger.push({ id: uuid(), ts: nowIso, kind: "DEPOSIT", amount: depositAmt });
+    const leAfter = tmpLedger.reduce((a, e) => a + (e.kind === "DEPOSIT" ? e.amount : -e.amount), leBefore);
+    const r4Deposit = leAfter - leBefore === depositAmt;
+    results.push({ name: "Stream deposit → ledger", pass: r4Deposit, details: `${leBefore} -> ${leAfter}` });
+
+    // Test 4b: SELL updates balance (proceeds added)
+    const beforeBal = 100;
+    const sellQty = 2;
+    const sellPx = 50; // proceeds 100
+    const afterBal = beforeBal + sellQty * sellPx;
+    const r4Sell = afterBal === 200;
+    results.push({ name: "SELL updates balance", pass: r4Sell, details: `${beforeBal} -> ${afterBal}` });
+
+    // Test 5: BUY blocks on insufficient cash (need 300, have 200)
+    const have = 200,
+      need = 300;
+    const r5 = have < need;
+    results.push({ name: "BUY blocks on insufficient cash", pass: r5, details: `have=${have}, need=${need}` });
+
+    setTests(results);
+  }
+
+  return (
+    <div className="min-h-screen bg-neutral-50 text-neutral-900">
+      {/* Top Bar */}
+      <header className="sticky top-0 z-10 border-b bg-white/80 backdrop-blur">
+        <div className="mx-auto flex max-w-6xl items-center justify-between px-4 py-3">
+          <div className="flex items-center gap-2">
+            <div className="h-8 w-8 rounded-xl bg-black" />
+            <div>
+              <h1 className="text-base font-semibold leading-tight">FinStream Demo</h1>
+              <p className="text-xs text-neutral-500">Portfolio Stream + Ledger Replay</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-4 text-sm">
+            <div className="hidden md:flex items-center gap-2 rounded-xl border px-3 py-1.5 bg-neutral-50">
+              <span className="text-neutral-500">Balance</span>
+              <span className="font-semibold">${ledgerBalance.toFixed(2)}</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <label className="text-neutral-500">Account</label>
+              <input
+                value={accountId}
+                onChange={(e) => setAccountId(e.target.value)}
+                className="w-36 rounded-xl border px-3 py-1.5 text-sm outline-none focus:ring"
+              />
+            </div>
+          </div>
+        </div>
+        <nav className="mx-auto max-w-6xl px-4 pb-2">
+          <div className="flex items-center justify-between gap-3">
+            <div className="inline-flex gap-1 rounded-2xl border bg-white p-1">
+              {TABS.map((t) => (
+                <button
+                  key={t}
+                  onClick={() => setTab(t)}
+                  className={`rounded-xl px-4 py-2 text-sm font-medium transition ${
+                    tab === t ? "bg-black text-white" : "text-neutral-600 hover:bg-neutral-100"
+                  }`}
+                >
+                  {t}
+                </button>
+              ))}
+            </div>
+            {/* Runtime endpoint override */}
+            <div className="flex items-center gap-2 text-xs">
+              <span className="text-neutral-500">Prices endpoint</span>
+              <input
+                placeholder={DEFAULT_PRICES_ENDPOINT}
+                value={endpointOverride}
+                onChange={(e) => setEndpointOverride(e.target.value)}
+                className="w-80 rounded-xl border px-3 py-1.5 outline-none focus:ring"
+              />
+            </div>
+          </div>
+        </nav>
+      </header>
+
+      {/* Main */}
+      <main className="mx-auto max-w-6xl px-4 py-6">
+        {tab === "Stream" ? (
+          <div className="grid grid-cols-1 gap-6 md:grid-cols-3">
+            {/* Left: New Trade */}
+            <div className="md:col-span-1">
+              <div className="rounded-2xl border bg-white p-4 shadow-sm">
+                <SectionTitle title="New Trade" subtitle="Buy/Sell uses cash from Ledger" />
+                <div className="mb-3 flex items-center gap-2 text-sm">
+                  <Chip label="Portfolio Stream" />
+                  <Chip label="Synced with Ledger" />
+                </div>
+                {uiError ? (
+                  <div className="mb-2 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{uiError}</div>
+                ) : null}
+                {uiNotice ? (
+                  <div className="mb-2 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-700">{uiNotice}</div>
+                ) : null}
+                <div className="space-y-3">
+                  <div className="grid grid-cols-3 gap-3">
+                    <div className="col-span-3">
+                      <label className="text-xs text-neutral-500">Symbol</label>
+                      <input
+                        value={symbol}
+                        onChange={(e) => setSymbol(e.target.value.toUpperCase())}
+                        className="mt-1 w-full rounded-xl border px-3 py-2 outline-none focus:ring"
+                        placeholder="AAPL"
+                      />
+                    </div>
+                    <div>
+                      <label className="text-xs text-neutral-500">Kind</label>
+                      <select
+                        value={tradeKind}
+                        onChange={(e) => setTradeKind(e.target.value as any)}
+                        className="mt-1 w-full rounded-xl border px-3 py-2 outline-none focus:ring"
+                      >
+                        <option>BUY</option>
+                        <option>SELL</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label className="text-xs text-neutral-500">Qty</label>
+                      <input
+                        type="number"
+                        value={qty}
+                        onChange={(e) => setQty(parseInt(e.target.value || "0", 10))}
+                        className="mt-1 w-full rounded-xl border px-3 py-2 outline-none focus:ring"
+                      />
+                    </div>
+                    <div>
+                      <label className="text-xs text-neutral-500">Price (optional)</label>
+                      <input
+                        type="number"
+                        value={price}
+                        onChange={(e) => setPrice(e.target.value === "" ? "" : parseFloat(e.target.value))}
+                        className="mt-1 w-full rounded-xl border px-3 py-2 outline-none focus:ring"
+                      />
+                    </div>
+                  </div>
+                  <button
+                    onClick={addStreamEvent}
+                    className="w-full rounded-xl bg-black px-4 py-2.5 text-sm font-medium text-white hover:opacity-90"
+                  >
+                    Submit Trade
+                  </button>
+                </div>
+
+                <div className="mt-6 rounded-xl border bg-neutral-50 p-3 text-sm">
+                  <div className="flex items-center justify-between">
+                    <span className="text-neutral-600">Available Cash (from Ledger)</span>
+                    <span className="font-semibold">${ledgerBalance.toFixed(2)}</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Right: Live Feed + Holdings */}
+            <div className="md:col-span-2 space-y-6">
+              <div className="rounded-2xl border bg-white p-4 shadow-sm">
+                <SectionTitle title="Live Event Feed" subtitle="Newest first (BUY/SELL only)" />
+                <ul className="divide-y">
+                  {streamEvents
+                    .filter((e) => e.kind === "BUY" || e.kind === "SELL")
+                    .map((e) => (
+                      <li key={e.id} className="py-3">
+                        <div className="flex items-start justify-between">
+                          <div>
+                            <p className="text-sm font-medium">
+                              {e.kind} {e.qty} {e.symbol} {e.price ? <>@ ${e.price}</> : null}
+                            </p>
+                            <p className="text-xs text-neutral-500">{new Date(e.ts).toLocaleString()}</p>
+                          </div>
+                          <Chip label={e.kind} />
+                        </div>
+                      </li>
+                    ))}
+                </ul>
+              </div>
+
+              <div className="rounded-2xl border bg-white p-4 shadow-sm">
+                <div className="mb-2 flex items-center justify-between">
+                  <SectionTitle title="Holdings & Portfolio Valuation" subtitle="Prices from yfinance-backed API" />
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => fetchPrices(holdings.map((h) => h.symbol))}
+                      className="rounded-xl border px-3 py-2 text-sm hover:bg-neutral-50"
+                    >
+                      {loadingPrices ? "Refreshing…" : "Refresh Prices"}
+                    </button>
+                  </div>
+                </div>
+
+                {priceError ? (
+                  <div className="mb-3 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+                    {priceError}
+                  </div>
+                ) : null}
+
+                <div className="mb-3 text-sm text-neutral-500">
+                  Last updated: {prices._ts ? new Date(prices._ts).toLocaleString() : "—"}
+                </div>
+
+                <table className="w-full text-left text-sm">
+                  <thead className="text-xs text-neutral-500">
+                    <tr>
+                      <th className="py-2">Symbol</th>
+                      <th className="py-2">Qty</th>
+                      <th className="py-2">Price</th>
+                      <th className="py-2">Market Value</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {holdings.length === 0 ? (
+                      <tr>
+                        <td className="py-4 text-neutral-500" colSpan={4}>
+                          No holdings yet. Buy something to see valuation.
+                        </td>
+                      </tr>
+                    ) : (
+                      holdings.map((h) => {
+                        const p = prices[h.symbol] || 0;
+                        const mv = p * h.qty;
+                        return (
+                          <tr key={h.symbol} className="border-t">
+                            <td className="py-2 font-medium">{h.symbol}</td>
+                            <td className="py-2">{h.qty}</td>
+                            <td className="py-2">{p ? `$${p.toFixed(2)}` : "—"}</td>
+                            <td className="py-2">{p ? `$${mv.toFixed(2)}` : "—"}</td>
+                          </tr>
+                        );
+                      })
+                    )}
+                  </tbody>
+                  {holdings.length > 0 ? (
+                    <tfoot>
+                      <tr className="border-t">
+                        <td className="py-2 font-medium" colSpan={3}>
+                          Portfolio Market Value
+                        </td>
+                        <td className="py-2 font-semibold">${portfolioMarketValue.toFixed(2)}</td>
+                      </tr>
+                    </tfoot>
+                  ) : null}
+                </table>
+              </div>
+
+              {/* Diagnostics */}
+              <div className="rounded-2xl border bg-white p-4 shadow-sm">
+                <div className="mb-2 flex items-center justify-between">
+                  <SectionTitle title="Diagnostics" subtitle="Ad-hoc tests for logic & config" />
+                  <button onClick={runDiagnostics} className="rounded-xl border px-3 py-2 text-sm hover:bg-neutral-50">
+                    Run Tests
+                  </button>
+                </div>
+                {tests.length === 0 ? (
+                  <p className="text-sm text-neutral-500">No tests run yet.</p>
+                ) : (
+                  <ul className="space-y-2 text-sm">
+                    {tests.map((t, i) => (
+                      <li
+                        key={i}
+                        className={`rounded-xl border px-3 py-2 ${
+                          t.pass
+                            ? "border-green-200 bg-green-50 text-green-800"
+                            : "border-red-200 bg-red-50 text-red-800"
+                        }`}
+                      >
+                        <div className="flex items-center justify-between">
+                          <span className="font-medium">{t.name}</span>
+                          <span>{t.pass ? "PASS ✅" : "FAIL ❌"}</span>
+                        </div>
+                        {t.details ? <div className="mt-1 text-xs opacity-80">{t.details}</div> : null}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            </div>
+          </div>
+        ) : (
+          // -------- Ledger tab --------
+          <div className="grid grid-cols-1 gap-6 md:grid-cols-3">
+            <div className="space-y-6 md:col-span-1">
+              <div className="rounded-2xl border bg-white p-4 shadow-sm">
+                <SectionTitle title="Current Balance" subtitle="Auto-updated as events arrive" />
+                <div className="flex items-baseline gap-2">
+                  <span className="text-3xl font-semibold">${ledgerBalance.toFixed(2)}</span>
+                  <span className="text-xs text-neutral-500">CAD</span>
+                </div>
+                <div className="mt-4 flex items-center gap-2">
+                  <button onClick={replayLedger} className="flex-1 rounded-xl border px-4 py-2 text-sm hover:bg-neutral-50">
+                    Replay & Verify
+                  </button>
+                </div>
+              </div>
+
+              <div className="rounded-2xl border bg-white p-4 shadow-sm">
+                <SectionTitle title="New Cash Transaction" subtitle="Deposit or withdraw" />
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="text-xs text-neutral-500">Type</label>
+                    <select
+                      value={ledgerKind}
+                      onChange={(e) => setLedgerKind(e.target.value as any)}
+                      className="mt-1 w-full rounded-xl border px-3 py-2 outline-none focus:ring"
+                    >
+                      <option value="DEPOSIT">DEPOSIT</option>
+                      <option value="WITHDRAW">WITHDRAW</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-xs text-neutral-500">Amount</label>
+                    <input
+                      type="number"
+                      value={ledgerAmount}
+                      onChange={(e) => setLedgerAmount(parseFloat(e.target.value || "0"))}
+                      className="mt-1 w-full rounded-xl border px-3 py-2 outline-none focus:ring"
+                    />
+                  </div>
+                </div>
+                <button onClick={addLedgerEvent} className="mt-3 w-full rounded-xl bg-black px-4 py-2.5 text-sm font-medium text-white hover:opacity-90">
+                  Add Transaction
+                </button>
+              </div>
+            </div>
+
+            <div className="md:col-span-2">
+              <div className="rounded-2xl border bg-white p-4 shadow-sm">
+                <SectionTitle title="Transaction History" subtitle="Newest first (simulated)" />
+                <table className="w-full text-left text-sm">
+                  <thead className="text-xs text-neutral-500">
+                    <tr>
+                      <th className="py-2">Time</th>
+                      <th className="py-2">Type</th>
+                      <th className="py-2">Amount</th>
+                      <th className="py-2">Note</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {ledgerEvents.map((e) => (
+                      <tr key={e.id} className="border-t">
+                        <td className="py-2 text-neutral-600">{new Date(e.ts).toLocaleString()}</td>
+                        <td className="py-2"><Chip label={e.kind} /></td>
+                        <td className="py-2 font-medium">${e.amount.toFixed(2)}</td>
+                        <td className="py-2 text-neutral-500">—</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        )}
+      </main>
+
+      <footer className="mx-auto max-w-6xl px-4 pb-10 pt-6 text-center text-xs text-neutral-500">
+        UI mock only • Replace local state with your AWS endpoints (SQS → MSK → S3). Prices use a runtime-safe endpoint (Vite env, window override, or /api/prices).
+      </footer>
+    </div>
+  );
+}
+

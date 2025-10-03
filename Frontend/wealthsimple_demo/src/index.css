@@ -1,0 +1,11 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* optional: a tiny reset so backgrounds look like your mock */
+:root {
+  color-scheme: light;
+}
+html, body, #root {
+  height: 100%;
+}
