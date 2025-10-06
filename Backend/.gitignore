@@ -26,7 +26,7 @@ Thumbs.db
 .terraform.lock.hcl
 terraform.tfstate
 terraform.tfstate.backup
-
+samconfig.toml
 # ---- Logs ----
 *.log
 
@@ -47,7 +47,7 @@ params.prod.json
 *.pem
 *.key
 *.crt
-
+env.json
 # ---- Cache / test outputs ----
 .pytest_cache/
 .coverage
